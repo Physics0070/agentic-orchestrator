@@ -1,0 +1,185 @@
+"""FastAPI entrypoint. One process serves the API and, when frontend/dist
+exists, the built React app (single-origin deployment, e.g. local uvicorn).
+
+Run from the repository root:
+    uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+"""
+
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from starlette.datastructures import MutableHeaders
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from backend import __version__
+from backend.api import router as api_router
+from backend.budget import DailyCapReached
+from backend.config import settings
+from backend.events import EventStoreError
+from backend.github_context import router as github_router
+from backend.limiter import limiter
+from backend.providers.base import ProviderAdapter
+
+logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)-8s %(message)s")
+log = logging.getLogger("aco")
+
+# Frontend build output, served for the single-origin deployment option.
+FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    yield
+    # Each provider adapter keeps one keep-alive httpx.AsyncClient per
+    # (provider, base_url) for the process lifetime (see ProviderAdapter._client)
+    # instead of opening a fresh connection per model call - closed here so a
+    # graceful shutdown doesn't leak open sockets.
+    await ProviderAdapter.aclose_all()
+
+
+app = FastAPI(
+    title="Agent Council Orchestrator",
+    version=__version__,
+    # Interactive docs are a dev affordance, not something to expose in prod.
+    docs_url=None if settings.is_prod else "/docs",
+    redoc_url=None,
+    lifespan=_lifespan,
+)
+
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; "
+        "connect-src 'self' https://api.github.com; object-src 'none'; "
+        "base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    ),
+}
+# Swagger UI (dev only) loads scripts from a CDN, which the CSP would block.
+_NO_CSP_PATHS = ("/docs", "/openapi.json")
+
+
+class SecurityHeadersMiddleware:
+    """Pure ASGI (not BaseHTTPMiddleware) so SSE streams are not buffered."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        skip_csp = scope["path"] in _NO_CSP_PATHS
+
+        async def send_wrapper(message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                for k, v in SECURITY_HEADERS.items():
+                    if k == "Content-Security-Policy" and skip_csp:
+                        continue
+                    headers[k] = v
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+# Same-origin on Vercel, so CORS only matters for the local Vite dev server
+# (CORS_ORIGINS, default http://localhost:5173). Explicit list, never "*".
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(settings.cors_origin_list),
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+
+@app.exception_handler(EventStoreError)
+async def event_log_unavailable(request: Request, exc: EventStoreError) -> JSONResponse:
+    """The event log is down or unconfigured. Its message is written to be safe
+    (it never carries a key), and "set TURSO_*" is the actionable part - a
+    generic 500 hid it."""
+    log.warning("event log unavailable on %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(
+        status_code=503, content={"error": "event_log_unavailable", "message": str(exc)[:200]}
+    )
+
+
+@app.exception_handler(DailyCapReached)
+async def daily_cap_reached(request: Request, exc: DailyCapReached) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={"error": "daily_cap_reached", "message": "Daily usage cap reached; try tomorrow."},
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Full detail to server logs, generic message to the client.
+
+    Stack traces, file paths and raw DB errors must never reach a response body.
+    """
+    log.exception("unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal_error", "message": "An internal error occurred."},
+    )
+
+
+@app.get("/health", tags=["ops"])
+@limiter.exempt
+async def health(request: Request) -> dict[str, str]:
+    """Liveness probe. Deliberately leaks no configuration."""
+    return {"status": "ok", "version": __version__}
+
+
+app.include_router(api_router)
+app.include_router(github_router)
+
+
+class SPAStaticFiles(StaticFiles):
+    """StaticFiles plus single-page-app fallback.
+
+    An unknown non-API path returns index.html so client-side routes survive a
+    refresh. /api/* misses stay a real 404 (JSON), never an HTML page.
+    """
+
+    async def get_response(self, path: str, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            # `path` is os-normalised (backslashes on Windows), so use the URL path.
+            if exc.status_code != 404 or scope["path"].startswith("/api/"):
+                raise
+            return await super().get_response("index.html", scope)
+
+
+def mount_frontend(application: FastAPI, dist: Path) -> bool:
+    """Serve a built frontend from `dist`. Mounted last so it cannot shadow
+    /health or any /api route. Returns False (API only) when there is no build."""
+    if not (dist / "index.html").is_file():
+        log.warning("frontend build not found at %s - serving API only", dist)
+        return False
+    application.mount("/", SPAStaticFiles(directory=dist, html=True), name="frontend")
+    return True
+
+
+mount_frontend(app, FRONTEND_DIST)

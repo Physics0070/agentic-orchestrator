@@ -1,0 +1,6 @@
+tests
+docs
+examples
+frontend/node_modules
+frontend/dist
+.venv
