@@ -105,8 +105,8 @@ example a free [Groq](https://console.groq.com) key. A free
 [Turso](https://turso.tech) database is recommended.
 
 ```bash
-git clone https://github.com/Physics0070/Unified-Agentic-Orchestrator.git
-cd Unified-Agentic-Orchestrator
+git clone https://github.com/Physics0070/agentic-orchestrator.git
+cd agentic-orchestrator
 ```
 
 ```bash

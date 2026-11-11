@@ -27,7 +27,7 @@ function Mark() {
   )
 }
 
-const REPO = 'https://github.com/Physics0070/Unified-Agentic-Orchestrator'
+const REPO = 'https://github.com/Physics0070/agentic-orchestrator'
 
 /**
  * The scroll story. Each step is a block of copy, the shape the cloud holds
